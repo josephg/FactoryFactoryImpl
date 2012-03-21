@@ -1,0 +1,336 @@
+print "Everyday I'm bufferin'"
+
+os.loadAPI('ev')
+
+rednet.open 'top'
+
+-- each route has:
+--  .state: 'OFFLINE', 'READY', 'RECEIVING', 'SEND_WAIT', 'SEND'
+--  .id: Computer's ID
+local buffers = {
+  buffer = {
+    t = 'buffer',
+    links = {
+      storage = { 'bottom', colors.lime },
+      wafer = { 'bottom', colors.red },
+    },
+    det = { 'back' }
+  },
+  storage = {
+    t = 'storage',
+    links = {
+      buffer = { 'bottom' }
+    },
+    contents = {
+      coal = 54, sand = 32
+    },
+    suck = {
+      sand = { 'left', colors.white },
+      coal = { 'left', colors.brown }
+    },
+    det = { 'right' },
+
+    -- Remove me when we have BFS
+    routes = { wafer = 'buffer' }
+  },
+  wafer = {
+    t = 'factory',
+    links = {
+      storage = {'bottom', colors.lime},
+      buffer = {'bottom', colors.white}
+    },
+    det = { 'back' },
+    input = { sand = 8, coal = 8 },
+    output = {
+      wafer = 16
+    },
+  }
+}
+
+-- Map of computer id -> computer's name
+local idToName = {}
+
+-- All buffers currently have an unknown state.
+for name, data in pairs(buffers) do
+  data.state = 'OFFLINE'
+  -- data.id = nil
+end
+
+local myname, mydata
+
+-- Current packet being processed. Nil when READY or OFFLINE
+local packet
+local nextHop
+
+-- Only for sources (like storage or factory outputs)
+local queue = {}
+
+-- The number of individual items we've detected entering the buffer. Only
+-- valid during RECV.
+local numItems = 0
+
+-- Pulse a bunch of endpoints a specified number of times.
+-- Call the callback (if present) when done.
+--
+-- Data is [{endpoint, number}, {endpoint, number}, ...]
+function pump(data, callback)
+  print(textutils.serialize(data))
+  local more = false
+  for i, d in ipairs(data) do
+    local endpoint, amt = unpack(d)
+    if amt > 0 then
+      ev.rsSet(endpoint, true)
+      if amt > 1 then more = true end
+    end
+  end
+
+  ev.setTimeout(0.5, function()
+    for i, d in ipairs(data) do
+      local endpoint, amt = unpack(d)
+      if amt > 0 then
+        ev.rsSet(endpoint, false)
+        d[2] = amt - 1
+      end
+    end
+  end)
+
+  ev.setTimeout(1.0, function()
+    if more then
+      --print(textutils.serialize(pump))
+      --print('requeue pump')
+      pump(data, callback)
+    else
+      --print('pump empty')
+      if callback then callback() end
+    end
+  end)
+end
+
+function configureName()
+  print 'Who am I?'
+
+  for name, data in pairs(buffers) do
+    if data.state == 'OFFLINE' then
+      print('- ' .. name)
+    end
+  end
+  repeat
+    myname = read()
+  until buffers[myname] ~= nil
+  os.setComputerLabel(myname)
+
+  comeOnline()
+end
+
+function changeState(newState)
+  print(mydata.state, ' -> ', newState)
+  mydata.state = newState
+  ev.broadcast('STATE', mydata.state, myname)
+end
+
+function err(message)
+  print('ERROR: ', message)
+  ev.broadcast('ERROR', message)
+end
+
+-- Get the name of the next machine in the packet's path
+function getNextHop()
+  local d = packet.destination
+  if myname == d then return nil end
+  if mydata.links[d] then return d end
+  
+  -- BFS.
+  return mydata.routes[d]
+end
+
+-- Send a request to the next buffer to receive the packet
+function sendRequest()
+  -- We get requeued in a timeout. If the request has been accepted, silently stop trying
+  -- to get the destination buffer's attention.
+  if mydata.state ~= 'SEND_WAIT' then return end
+
+  if packet == nil then return err('No packet data') end
+
+  if nextHop == nil then err('The packet has already reached the destination.') end
+
+  if buffers[nextHop].state == 'READY' then
+    ev.send(buffers[nextHop].id, 'RECVPLX', packet)
+  end
+
+  ev.setTimeout(2, sendRequest)
+end
+
+-- My name should be in myname by now.
+function comeOnline()
+  print(myname .. " online!")
+  mydata = buffers[myname]
+  mydata.id = os.computerID() -- Probably not useful, but eh
+  idToName[mydata.id] = myname
+  changeState 'READY'
+
+  -- Heartbeat.
+  ev.setInterval(3, function()
+    ev.broadcast('STATE', mydata.state, myname)
+  end)
+
+  -- Listen to the detector
+  ev.registerRedwire(mydata.det, function(v)
+    if v == false then return end
+    print('det')
+    if mydata.state ~= 'RECEIVING' then
+      err('Detected matter when state is ' .. mydata.state)
+      return
+    end
+
+    numItems = numItems + 1
+
+    if numItems == packet.num then
+      -- Read in entire packet.
+      nextHop = getNextHop()
+      changeState 'SEND_WAIT'
+      ev.setTimeout(4, function()
+        -- Small delay to let the last items move from the detector to the chest.
+        sendRequest()
+      end)
+    end
+  end)
+end
+
+function printRoutes()
+  print()
+  for name, data in pairs(buffers) do
+    print('Route ', name, ' state: ', data.state, ' id: ', data.id)
+  end
+end
+
+-- myname starts as nil for the first second of execution.
+myname = os.getComputerLabel()
+
+if myname == nil or buffers[myname] == nil then
+  ev.setTimeout(1, configureName)
+else
+  comeOnline()
+end
+
+ev.broadcast 'REPORT'
+
+-- Reap.
+ev.setInterval(5, function()
+  for name, data in pairs(buffers) do
+    if name ~= myname and data.state ~= 'OFFLINE'
+        and data.lastMessage + 5 < os.clock() then
+      print(name, ' timed out')
+      data.state = 'OFFLINE'
+      idToName[data.id] = nil
+      data.id = nil
+    end
+  end
+end)
+
+function tryDequeue()
+  if mydata.t ~= 'storage' then return end
+  if packet ~= nil or mydata.state ~= 'READY' then return end
+  if #queue == 0 then return end
+
+  for name, amt in pairs(queue[1].contents) do
+    if mydata.contents[name] == nil or mydata.contents[name] < amt then return end
+
+    if mydata.suck[name] == nil then
+      print('WARNING: Cannot retreive ', name)
+      return
+    end
+  end
+
+  -- Commit point. No going back now. (Unless we push the packet back on)
+
+  packet = table.remove(queue, 1)
+  packet.num = 0
+  for name, amt in pairs(packet.contents) do
+    packet.num = packet.num + amt
+  end
+  
+  changeState 'RECEIVING'
+
+  print('Processing packet with ' .. packet.num .. ' items')
+  pumpData = {}
+  for name, amt in pairs(packet.contents) do
+    pumpData[#pumpData + 1] = {mydata.suck[name], amt}
+  end
+  pump(pumpData)
+end
+
+rpc = {
+  REBOOT = function()
+    ev.broadcast('STATE', 'OFFLINE')
+    return 'STOP'
+  end,
+
+  STATE = function(sender, newstate, name)
+    if name == nil then
+      name = idToName[sender]
+    else
+      idToName[sender] = name
+    end
+    if buffers[name].state ~= newstate then
+      print(name, ' ', buffers[name].state, ' -> ', newstate)
+    end
+    buffers[name].state = newstate
+    buffers[name].id = sender
+    buffers[name].lastMessage = os.clock()
+  end,
+
+  REPORT = function(sender)
+    if myname ~= nil then
+      ev.send(sender, 'STATE', mydata.state, myname)
+    end
+  end,
+
+  -- Ignore halp - thats just for the server.
+  HELP = function() end,
+
+  RECVPLX = function(sender, newpacket)
+    if mydata.t == 'factory' then
+      ev.send(sender, 'CANHAS')
+    elseif mydata.state == 'READY' then
+      changeState 'RECEIVING'
+      packet = newpacket
+      print('packet ', textutils.serialize(packet))
+      ev.send(sender, 'CANHAS')
+    end
+  end,
+
+  CANHAS = function()
+    changeState 'SEND'
+    pump({{mydata.links[nextHop], packet.num}}, function()
+      changeState 'READY'
+    end)
+  end,
+}
+
+stop = ev.run(rpc, function(e, ...)
+  if e == 'char' then
+    key = ...
+    if key == 'p' then
+      printRoutes()
+    elseif key == 'R' then
+      print 'BRB Rebooting.'
+      ev.broadcast('STATE', 'OFFLINE')
+      return 'STOP'
+
+    elseif key == 'z' and myname == 'storage' then
+      queue[#queue + 1] = {
+        contents = { coal = 8, sand = 8 },
+        source = 'storage',
+        destination = 'wafer'
+      }
+      print 'Injecting packet'
+      tryDequeue()
+    end
+  elseif e == 'redstone' then
+    p1, p2 = ...
+    print('redstone ', p1, ' ', p2)
+  elseif e ~= 'key' and e ~= 'timer' then
+    p1, p2 = ...
+    print('Ignoring event ', e, ' ', p1, ' ', p2)
+  end
+end)

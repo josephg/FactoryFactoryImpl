@@ -1,0 +1,148 @@
+
+os.loadAPI('textutils')
+
+-- Javascript setTimeout style timers. (Except with sane argument order)
+local timers = {}
+function setTimeout(time, fn)
+  local id = os.startTimer(time)
+  timers[id] = fn
+end
+
+function setInterval(time, fn)
+  setTimeout(time, function()
+    setInterval(time, fn)
+    fn()
+  end)
+end
+
+-- Network messages have a message name then a space then a table of arguments.
+-- Eg, "STATUS {[1]="ONLINE"}"
+local function parseMsg(msg)
+  local gap = msg:find ' '
+  if gap == nil then return msg, {} end
+
+  local cmd = msg:sub(1, gap - 1)
+  local args = textutils.unserialize(msg:sub(gap + 1, -1))
+  return cmd, args
+end
+
+local function pack(cmd, ...)
+  return cmd .. ' ' .. textutils.serialize{...}
+end
+
+function broadcast(cmd, ...)
+  rednet.broadcast(pack(cmd, ...))
+end
+
+function send(dest, cmd, ...)
+  if type(dest) == 'string' then
+    dest = routes[dest].id
+  end
+  --print(pack(cmd, ...))
+  rednet.send(dest, pack(cmd, ...))
+end
+
+
+-- Redwire handlers
+--
+-- endpoints look like {'back'} or {'back', colors.black} for bundled cable
+
+function rsTest(endpoint)
+  local side, colors = unpack(endpoint)
+
+  if colors == nil then
+    return rs.getInput(side)
+  else
+    return rs.testBundledInput(side, colors)
+  end
+end
+
+local rsState = {} -- Maps sides -> either a bool or an int of states.
+
+function rsSet(endpoint, value)
+  local side, c = unpack(endpoint)
+
+  if c == nil then
+    rsState[side] = value
+    rs.setOutput(side, value)
+  else
+    -- The API sets a full set of values together. We need to combine the
+    -- new value with the previously set values.
+    local prev = rsState[side] or 0
+    if value then
+      c = colors.combine(prev, c)
+    else
+      c = colors.subtract(prev, c)
+    end
+    rsState[side] = c
+    --print(c)
+    rs.setBundledOutput(side, c)
+  end
+end
+
+-- List of {endpoint, currentValue, handler}
+local rsHandlers = {}
+
+-- Register a callback function to be called when the endpoint changes. The
+-- function is passed the new state.
+function registerRedwire(endpoint, fn)
+  rsHandlers[#rsHandlers + 1] = {endpoint, rsTest(endpoint), fn}
+end
+
+-- Stuff to do on the next tick (if any).
+local nextTickFns
+
+-- process.nextTick from nodejs
+function nextTick(fn)
+  nextTickFns = nextTickFns or {}
+  nextTickFns[#nextTickFns + 1] = fn
+end
+
+function run(rpc, handler)
+  local running = true
+
+  while running do
+    local e, p1, p2, p3, p4, p5 = os.pullEvent()
+
+    local ret
+
+    if e == 'rednet_message' then
+      local sender, cmd, args = p1, parseMsg(p2)
+
+      if rpc[cmd] then
+        ret = rpc[cmd](sender, unpack(args))
+      else
+        ret = handler(e, sender, cmd, args)
+      end
+
+    elseif e == 'timer' then
+      fn = timers[p1]
+      if fn ~= nil then
+        ret = fn()
+        timers[p1] = nil
+      else
+        ret = handler(e, p1)
+      end
+    elseif e == 'redstone' then
+      for i, handler in ipairs(rsHandlers) do
+        local endpoint, prevValue, fn = unpack(handler)
+        local v = rsTest(endpoint)
+        if v ~= prevValue then
+          fn(v, endpoint)
+          handler[2] = v
+        end
+      end
+    else
+      ret = handler(e, p1, p2, p3, p4, p5)
+    end
+
+    if ret == 'STOP' then running = false end
+
+    if nextTickFns then
+      for i, fn in ipairs(nextTickFns) do
+        fn()
+      end
+      nextTickFns = nil
+    end
+  end
+end

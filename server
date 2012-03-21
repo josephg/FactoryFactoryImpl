@@ -1,0 +1,68 @@
+print 'Server.'
+
+function getScript(name)
+  local client_script
+  web_file = http.get('http://sephsmac.local./~josephg/' .. name)
+  if web_file ~= nil then
+    client_script = web_file.readAll()
+
+    local out = fs.open('/'..name, 'w')
+    out.write(client_script)
+    out.close()
+    print('Updated ' .. name)
+    return client_script
+  else
+    return fs.open('/' .. name, 'r').readAll()
+  end
+end
+
+function getScripts(scripts)
+  code = {}
+  for i, v in ipairs(scripts) do
+    code[v] = getScript(v)
+  end
+  return code
+end
+
+-- First get a new copy of the server script, incase its been broken by exceptions below.
+getScript('server')
+getScript('ev')
+getScript('textutils')
+
+os.loadAPI('textutils')
+os.loadAPI('ev')
+
+local client_scripts = {
+  'buffer',
+  'textutils',
+  'startup-client',
+  'ev'
+}
+
+-- local scripts = getScripts(client_scripts)
+
+rednet.open('top')
+
+rpc = {
+  HALP = function(sender)
+    print('Updating client '..sender)
+    rednet.send(sender, 'PROG '..textutils.serialize(getScripts(client_scripts)))
+    -- I could just send the scripts instead of re-fetching them each time.
+--    rednet.send(sender, 'PROG '..textutils.serialize(scripts))
+  end,
+
+}
+
+ev.run(rpc, function(e, ...)
+  if e == 'rednet_message' then
+    sender, cmd = ...
+    print(cmd, ' from ', sender)
+  elseif e == 'char' then
+    key = ...
+    if key == 'R' then
+      ev.broadcast('REBOOT')
+    elseif key == 'p' then
+    end
+  end
+end)
+
